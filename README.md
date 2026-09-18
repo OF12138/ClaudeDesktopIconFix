@@ -98,11 +98,14 @@ powershell -ExecutionPolicy Bypass -File .\Fix-ClaudeTaskbarIcon.ps1
 The script will:
 
 1. Locate the package via `Get-AppxPackage -Name Claude`, whatever its version.
-2. Copy the four original PNGs to `backup\` (only on the first run, so the backup
-   always holds pristine files).
-3. Take ownership of each file and grant `Administrators` full control.
-4. Overwrite the bytes with the 256×256 assets from `assets\`.
-5. Clear the shell icon cache and restart `explorer.exe`. Your screen will flicker.
+2. Skip every file that already matches the replacement, so running it twice is
+   harmless.
+3. Copy the originals to `backup\<version>\`, once per Claude version, so the
+   backup always holds pristine files.
+4. Take ownership of each file and grant `Administrators` full control.
+5. Overwrite the bytes with the 256×256 assets from `assets\`.
+6. If anything changed, clear the shell icon cache and restart `explorer.exe`. Your
+   screen will flicker.
 
 If the taskbar still shows the old icon afterwards, unpin Claude and pin it again, or
 sign out and back in.
@@ -113,8 +116,42 @@ sign out and back in.
 .\Fix-ClaudeTaskbarIcon.ps1 -Restore
 ```
 
-This reads from `backup\`, so it only works on the machine where you applied the fix.
-Reinstalling Claude Desktop also restores the original icons.
+This reads from `backup\<installed version>\`, so it only works on the machine where
+you applied the fix. Reinstalling Claude Desktop also restores the original icons.
+
+## Re-apply automatically after every update
+
+Every Claude Desktop update installs a fresh package directory, which brings the 24×24
+icon back. To have the fix re-applied automatically, run this once from an elevated
+PowerShell:
+
+```powershell
+.\Install-AutoReapply.ps1
+```
+
+It registers a scheduled task named `ClaudeIconFixAutoReapply` and applies the fix to
+the version installed right now.
+
+- **Trigger:** event **400** ("deployment succeeded") in
+  `Microsoft-Windows-AppXDeploymentServer/Operational`, filtered with XPath on
+  `PackageDisplayName = 'Claude'`. It fires once per completed Claude install or
+  update, and not for any other app. The task waits 20 seconds so the updater can
+  relaunch Claude first, then runs `Fix-ClaudeTaskbarIcon.ps1 -Unattended`.
+- **Cost when idle: none.** There is no polling and no resident process. The Event Log
+  service evaluates the filter only for events written to that one channel.
+- **Effect when it fires:** `explorer.exe` restarts once, which also closes any open
+  File Explorer windows. Claude updates itself while you are idle, so you usually
+  won't notice.
+- The script and a copy of `assets\` are installed to
+  `%ProgramData%\ClaudeDesktopIconFix\` and locked so that only administrators can
+  modify them, because the task runs elevated. **If you change `assets\` later, run
+  the installer again** to pick up the new images.
+- Log: `%ProgramData%\ClaudeDesktopIconFix\reapply.log`
+- Remove: `.\Install-AutoReapply.ps1 -Uninstall`
+
+If your Claude Desktop also sometimes quits and will not start again until you reboot,
+that is a separate problem with the same updates. See
+[Claude-Desktop-Update-Fix](https://github.com/OF12138/Claude-Desktop-Update-Fix).
 
 ## Using your own icon
 
@@ -140,6 +177,7 @@ transparent glyph for the taskbar, a rounded coloured square for the Start menu 
 
 ```
 Fix-ClaudeTaskbarIcon.ps1              apply / roll back the fix
+Install-AutoReapply.ps1                re-apply automatically after every update
 assets/                                the 256x256 replacement PNGs
   Square44x44Logo.targetsize-24_altform-unplated.png    taskbar + Alt-Tab
   Square44x44Logo.png                                   Start menu tile
@@ -152,9 +190,8 @@ tools/Convert-IcoToAssets.ps1          build assets/ from your own .ico or .png
 ## Caveats
 
 - **A Claude Desktop update reverts the icons.** An MSIX upgrade rewrites the whole
-  package directory. Just run the script again; it resolves the new version
-  automatically. Delete `backup\` first if you want a fresh backup of the new
-  original assets.
+  package directory. Either run the script again, since it finds the new version
+  automatically, or install the automatic re-apply task described above.
 - The script permanently changes the owner and ACL of those four files from
   `TrustedInstaller` to `Administrators`. This is required to write them at all and
   has no other effect; a reinstall resets it.

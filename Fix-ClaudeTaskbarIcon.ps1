@@ -18,16 +18,24 @@
     the package does not have to be repacked or re-signed, and the package identity
     is untouched - your Claude login and application data are preserved.
 
+    The script is idempotent: files that already match the replacement are skipped,
+    and explorer.exe is restarted only if something actually changed.
+
 .PARAMETER Restore
-    Puts the original icons back from the backup created on the first run.
+    Puts the original icons of the installed version back from its backup.
 
 .PARAMETER AssetsPath
-    Folder holding the replacement PNG files. Defaults to the 'assets' folder
-    next to this script.
+    Folder holding the replacement PNG files. Defaults to 'assets' next to this script.
 
 .PARAMETER BackupPath
-    Folder used to store the untouched originals. Defaults to 'backup' next to
-    this script.
+    Root folder for the untouched originals, one subfolder per Claude version.
+    Defaults to 'backup' next to this script.
+
+.PARAMETER Unattended
+    No console output (used by the scheduled task). Combine with -LogPath.
+
+.PARAMETER LogPath
+    Optional log file.
 
 .EXAMPLE
     PS> .\Fix-ClaudeTaskbarIcon.ps1
@@ -38,13 +46,15 @@
 .NOTES
     Must be run from an elevated (Administrator) PowerShell session.
     A Claude Desktop update rewrites the package directory and reverts the icons;
-    simply run this script again afterwards.
+    run this script again afterwards, or let Install-AutoReapply.ps1 do it for you.
 #>
 [CmdletBinding()]
 param(
     [switch]$Restore,
     [string]$AssetsPath,
-    [string]$BackupPath
+    [string]$BackupPath,
+    [switch]$Unattended,
+    [string]$LogPath
 )
 
 $ErrorActionPreference = 'Stop'
@@ -57,6 +67,13 @@ $IconFiles = @(
     'icon.png'                                            # package logo
 )
 
+function Log([string]$Message, [string]$Color = 'Gray') {
+    if (-not $Unattended) { Write-Host $Message -ForegroundColor $Color }
+    if ($LogPath) {
+        Add-Content -Path $LogPath -Encoding UTF8 -Value ('{0:yyyy-MM-dd HH:mm:ss}  {1}' -f (Get-Date), $Message)
+    }
+}
+
 function Assert-Elevated {
     $identity  = [Security.Principal.WindowsIdentity]::GetCurrent()
     $principal = [Security.Principal.WindowsPrincipal]$identity
@@ -65,7 +82,7 @@ function Assert-Elevated {
     }
 }
 
-function Get-ClaudeAssetsFolder {
+function Get-ClaudePackage {
     $pkg = Get-AppxPackage -Name 'Claude' -ErrorAction SilentlyContinue | Select-Object -First 1
     if (-not $pkg) {
         throw 'No MSIX package named "Claude" is registered for this user. This script only applies to the MSIX/Store build of Claude Desktop.'
@@ -74,11 +91,14 @@ function Get-ClaudeAssetsFolder {
     if (-not (Test-Path $assets)) {
         throw "Package found at $($pkg.InstallLocation) but it has no 'assets' folder."
     }
-    [pscustomobject]@{ Version = $pkg.Version; Path = $assets }
+    [pscustomobject]@{ Version = $pkg.Version; Assets = $assets }
 }
 
-function Unlock-File {
-    param([string]$Path)
+function Test-SameContent([string]$A, [string]$B) {
+    (Get-FileHash -Algorithm SHA256 $A).Hash -eq (Get-FileHash -Algorithm SHA256 $B).Hash
+}
+
+function Unlock-File([string]$Path) {
     # WindowsApps content is owned by TrustedInstaller; take ownership and grant Administrators full control.
     $admins = (New-Object System.Security.Principal.SecurityIdentifier 'S-1-5-32-544').
               Translate([System.Security.Principal.NTAccount]).Value
@@ -87,7 +107,7 @@ function Unlock-File {
 }
 
 function Reset-ShellIconCache {
-    Write-Host 'Clearing the shell icon cache and restarting explorer.exe ...' -ForegroundColor Cyan
+    Log 'Clearing the shell icon cache and restarting explorer.exe ...' 'Cyan'
     Stop-Process -Name explorer -Force -ErrorAction SilentlyContinue
     Start-Sleep -Milliseconds 800
     $cache = Join-Path $env:LOCALAPPDATA 'Microsoft\Windows\Explorer'
@@ -104,33 +124,34 @@ function Reset-ShellIconCache {
 
 Assert-Elevated
 
-$scriptRoot = Split-Path -Parent $MyInvocation.MyCommand.Path
-if (-not $AssetsPath) { $AssetsPath = Join-Path $scriptRoot 'assets' }
-if (-not $BackupPath) { $BackupPath = Join-Path $scriptRoot 'backup' }
+if (-not $AssetsPath) { $AssetsPath = Join-Path $PSScriptRoot 'assets' }
+if (-not $BackupPath) { $BackupPath = Join-Path $PSScriptRoot 'backup' }
 
-$pkg = Get-ClaudeAssetsFolder
-Write-Host "Claude Desktop $($pkg.Version)" -ForegroundColor Cyan
-Write-Host "Assets folder: $($pkg.Path)`n"
+$pkg           = Get-ClaudePackage
+$versionBackup = Join-Path $BackupPath $pkg.Version
+Log "Claude Desktop $($pkg.Version)" 'Cyan'
+Log "Assets folder: $($pkg.Assets)"
 
-$sourceDir = if ($Restore) { $BackupPath } else { $AssetsPath }
+$sourceDir = if ($Restore) { $versionBackup } else { $AssetsPath }
 if (-not (Test-Path $sourceDir)) {
-    throw "Source folder not found: $sourceDir" +
-          $(if ($Restore) { ' - there is nothing to restore (the fix was never applied from this folder).' } else { '' })
+    if ($Restore) { throw "No backup for version $($pkg.Version) in $BackupPath - the fix was never applied to this version from here." }
+    throw "Replacement assets not found: $sourceDir"
 }
-
-if (-not $Restore) { New-Item -ItemType Directory -Force -Path $BackupPath | Out-Null }
+if (-not $Restore) { New-Item -ItemType Directory -Force -Path $versionBackup | Out-Null }
 
 $changed = 0
 foreach ($name in $IconFiles) {
-    $target = Join-Path $pkg.Path   $name
+    $target = Join-Path $pkg.Assets $name
     $source = Join-Path $sourceDir  $name
 
-    if (-not (Test-Path $target)) { Write-Warning "Not present in the package, skipped: $name"; continue }
-    if (-not (Test-Path $source)) { Write-Warning "Not present in $sourceDir, skipped: $name";  continue }
+    if (-not (Test-Path $target)) { Log "  not present in the package, skipped: $name" 'Yellow'; continue }
+    if (-not (Test-Path $source)) { Log "  not present in $sourceDir, skipped: $name" 'Yellow'; continue }
 
-    # Back up the pristine original once, before the first overwrite.
+    if (Test-SameContent $source $target) { Log ("  {0,-52} already up to date" -f $name); continue }
+
+    # Back up the pristine original of this version once, before the first overwrite.
     if (-not $Restore) {
-        $backupFile = Join-Path $BackupPath $name
+        $backupFile = Join-Path $versionBackup $name
         if (-not (Test-Path $backupFile)) { Copy-Item -Path $target -Destination $backupFile -Force }
     }
 
@@ -140,17 +161,17 @@ foreach ($name in $IconFiles) {
     # to each other inside the package, and this keeps the behaviour predictable.
     [System.IO.File]::WriteAllBytes($target, [System.IO.File]::ReadAllBytes($source))
 
-    $size = (Get-Item $target).Length
-    Write-Host ("  {0,-52} {1,8:N0} bytes" -f $name, $size) -ForegroundColor Green
+    Log ("  {0,-52} {1,8:N0} bytes" -f $name, (Get-Item $target).Length) 'Green'
     $changed++
 }
 
-if ($changed -eq 0) { Write-Warning 'Nothing was changed.'; return }
+if ($changed -eq 0) {
+    Log 'Nothing to change.' 'Green'
+    return
+}
 
-if (-not $Restore) { Write-Host "`nOriginals backed up to: $BackupPath" }
-
-Write-Host ''
+if (-not $Restore) { Log "Originals backed up to: $versionBackup" }
 Reset-ShellIconCache
 
-Write-Host "`nDone." -ForegroundColor Green
-Write-Host 'If the taskbar still shows the old icon: unpin Claude, then pin it again, or sign out and back in.' -ForegroundColor Yellow
+Log 'Done.' 'Green'
+Log 'If the taskbar still shows the old icon: unpin Claude, then pin it again, or sign out and back in.' 'Yellow'

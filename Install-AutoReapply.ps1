@@ -51,9 +51,12 @@ if ($Uninstall) {
 }
 
 # 1) Install script + assets where only administrators can change them.
-New-Item -ItemType Directory -Force -Path (Join-Path $InstallDir 'assets') | Out-Null
+# The assets folder is recreated so files from earlier versions do not linger.
+$assetsDir = Join-Path $InstallDir 'assets'
+Remove-Item -Recurse -Force $assetsDir -ErrorAction SilentlyContinue
+New-Item -ItemType Directory -Force -Path $assetsDir | Out-Null
 Copy-Item -Force (Join-Path $PSScriptRoot 'Fix-ClaudeTaskbarIcon.ps1') $Script
-Copy-Item -Force (Join-Path $PSScriptRoot 'assets\*.png') (Join-Path $InstallDir 'assets')
+Copy-Item -Force (Join-Path $PSScriptRoot 'assets\*.png') $assetsDir
 # SYSTEM and Administrators: full control. Users: read/execute.
 & icacls.exe $InstallDir /inheritance:r /grant:r '*S-1-5-18:(OI)(CI)F' '*S-1-5-32-544:(OI)(CI)F' '*S-1-5-32-545:(OI)(CI)RX' | Out-Null
 
